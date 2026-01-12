@@ -1,3 +1,4 @@
+o codigo ta correto e calculando a loss so pra resposta?
 import os
 import json
 import random
@@ -7,10 +8,13 @@ from datasets import load_dataset
 from huggingface_hub import login
 import wandb
 from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
-from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
+from peft import LoraConfig, prepare_model_for_kbit_training
 from trl import SFTTrainer, SFTConfig
 
 hf_user = "juliadollis"
+hf_token = os.getenv("HF_TOKEN")
+if hf_token:
+    login(token=hf_token)
 
 seed = 3407
 random.seed(seed)
@@ -19,12 +23,12 @@ torch.manual_seed(seed)
 if torch.cuda.is_available():
     torch.cuda.manual_seed_all(seed)
 
-model_name = "Qwen/Qwen3-4B-Instruct-2507"
+model_name = "Qwen/Qwen2.5-0.5B-Instruct"
 dataset_path = "juliadollis/sinth_qwen235b_evasion_justifications_all"
-epoca = 1
+epoca = 3
 
 model_short = model_name.split("/")[-1]
-repo_base_name = f"TESTT{model_short}_{epoca}ep_json_just_labelv2_2_masked"
+repo_base_name = f"{model_short}_{epoca}ep_assistant_only_v2"
 hub_model_id = f"{hf_user}/{repo_base_name}"
 output_dir = repo_base_name
 
@@ -69,15 +73,22 @@ print("Carregando dataset...")
 ds = load_dataset(dataset_path, split="train").shuffle(seed=seed)
 ds_splits = ds.train_test_split(test_size=0.1, seed=seed)
 
-tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True, trust_remote_code=True)
+tokenizer = AutoTokenizer.from_pretrained(
+    model_name,
+    use_fast=True,
+    trust_remote_code=True
+)
+
 if tokenizer.pad_token is None:
     tokenizer.pad_token = tokenizer.eos_token
 tokenizer.padding_side = "right"
 
+tokenizer.chat_template = """{% for message in messages %}{{'<|im_start|>' + message['role'] + '\n'}}{% if message['role'] == 'assistant' %}{% generation %}{{message['content']}}{% endgeneration %}{% else %}{{message['content']}}{% endif %}{{'<|im_end|>\n'}}{% endfor %}"""
+
 def _safe_str(x):
     return x if isinstance(x, str) else ""
 
-def create_prompt_completion(example):
+def format_chat(example):
     question = _safe_str(example.get("interview_question")).strip()
     answer = _safe_str(example.get("interview_answer")).strip()
     label = _safe_str(example.get("clarity_label")).strip()
@@ -85,44 +96,39 @@ def create_prompt_completion(example):
 
     label = " ".join(label.split())
 
-    if (not question) or (not answer) or (not justification) or (label not in valid_labels):
-        return {"keep": False}
+    if not question or not answer or not justification or label not in valid_labels:
+        return None
 
-    prompt_text = PROMPT.format(
+    user_content = PROMPT.format(
         TAXONOMY=TAXONOMY.strip(),
         INTERVIEW_QUESTION=question,
         INTERVIEW_ANSWER=answer
-    )
+    ).strip()
 
-    completion_text = json.dumps(
+    assistant_content = json.dumps(
         {"justification": justification, "label": label},
         ensure_ascii=False
     )
 
-    messages = [
-        {"role": "user", "content": prompt_text}
-    ]
-
-    prompt_chat = tokenizer.apply_chat_template(
-        messages,
-        add_generation_prompt=True,
-        tokenize=False
-    )
-
     return {
-        "keep": True,
-        "prompt": prompt_chat,
-        "completion": completion_text
+        "messages": [
+            {"role": "user", "content": user_content},
+            {"role": "assistant", "content": assistant_content}
+        ]
     }
 
-print("Aplicando formatação Prompt-Completion...")
-train_mapped = ds_splits["train"].map(create_prompt_completion, remove_columns=ds_splits["train"].column_names)
-test_mapped = ds_splits["test"].map(create_prompt_completion, remove_columns=ds_splits["test"].column_names)
+print("Formatando datasets...")
+train_ds = ds_splits["train"].map(
+    format_chat,
+    remove_columns=ds_splits["train"].column_names
+).filter(lambda x: x is not None)
 
-ds_train = train_mapped.filter(lambda x: x["keep"]).remove_columns(["keep"])
-ds_test = test_mapped.filter(lambda x: x["keep"]).remove_columns(["keep"])
+test_ds = ds_splits["test"].map(
+    format_chat,
+    remove_columns=ds_splits["test"].column_names
+).filter(lambda x: x is not None)
 
-print(f"Treino: {len(ds_train)} | Teste: {len(ds_test)}")
+print(f"Treino: {len(train_ds)} | Teste: {len(test_ds)}")
 
 use_bf16 = bool(torch.cuda.is_available() and torch.cuda.is_bf16_supported())
 compute_dtype = torch.bfloat16 if use_bf16 else torch.float16
@@ -144,21 +150,23 @@ model = AutoModelForCausalLM.from_pretrained(
 )
 
 model = prepare_model_for_kbit_training(model)
+model.config.use_cache = False
 
 peft_config = LoraConfig(
     r=16,
     lora_alpha=16,
     lora_dropout=0.05,
     bias="none",
-    target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+    target_modules=[
+        "q_proj", "k_proj", "v_proj", "o_proj",
+        "gate_proj", "up_proj", "down_proj"
+    ],
     task_type="CAUSAL_LM"
 )
 
-model = get_peft_model(model, peft_config)
-model.config.use_cache = False
-
 wandb_api_key = os.getenv("WANDB_API_KEY")
 report_to = "wandb" if wandb_api_key else "none"
+
 if report_to == "wandb":
     wandb.init(project=os.getenv("WANDB_PROJECT", "sft"), name=repo_base_name)
 
@@ -178,7 +186,7 @@ args = SFTConfig(
     optim="adamw_8bit",
     weight_decay=0.01,
     lr_scheduler_type="cosine",
-    warmup_ratio=0.03,
+    warmup_steps=100,
     max_length=2048,
     packing=False,
     seed=seed,
@@ -186,22 +194,26 @@ args = SFTConfig(
     run_name=repo_base_name,
     push_to_hub=True,
     hub_model_id=hub_model_id,
-    hub_strategy="every_save"
+    hub_strategy="every_save",
+    dataset_text_field="messages",
+    assistant_only_loss=True
 )
 
 trainer = SFTTrainer(
     model=model,
-    train_dataset=ds_train,
-    eval_dataset=ds_test,
-    args=args
+    train_dataset=train_ds,
+    eval_dataset=test_ds,
+    args=args,
+    peft_config=peft_config,
+    processing_class=tokenizer
 )
 
 print("Iniciando treinamento...")
 trainer.train()
 
 print("Avaliando...")
-results = trainer.evaluate()
-print(results)
+metrics = trainer.evaluate()
+print(metrics)
 
 print("Enviando para o Hub...")
 trainer.push_to_hub()
